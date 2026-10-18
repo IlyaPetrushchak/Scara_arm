@@ -122,7 +122,9 @@ constexpr float HOME_ARM2_SPEED_DEG_S = 80.0f; // 80 * 64.7 кроків/° = ~5
 constexpr float HOME_Z_SPEED_MM_S = 12.0f;     // 12 * 1600 кроків/мм = 19200 Гц
 
 constexpr float TOOL_ROTATE_SPEED_DEG_S = 45.0f;
-constexpr float GRIP_SPEED_DEG_S = 300.0f; // було 140: менше "мертвого ходу" при відкритті
+constexpr float GRIP_SPEED_DEG_S = 120.0f;         // швидкість цілі схвата при повному натиску (було 300 — давало ривки)
+constexpr float GRIP_RAMP_S = 0.15f;               // час плавного розгону/гальмування команди схвата
+constexpr float GRIP_OUTPUT_SLEW_DEG_S = 180.0f;   // макс. швидкість зміни кута, що йде на серву (плавність, у т.ч. при HOME)
 
 constexpr int SERVO_ROTATE_MIN_US = 500;
 constexpr int SERVO_ROTATE_MAX_US = 2500;
@@ -882,8 +884,14 @@ int angleToPulseUs(float angleDeg, int minUs, int maxUs)
 
 void updateServoTargets(float rotateCmd, float gripCmd, float dt)
 {
+    // Плавний розгін/гальмування команди схвата (без різких стрибків швидкості)
+    static float gripCmdSmoothed = 0.0f;
+    const float k = clampFloat(dt / GRIP_RAMP_S, 0.0f, 1.0f);
+    gripCmdSmoothed += (gripCmd - gripCmdSmoothed) * k;
+    if (gripCmd == 0.0f && fabsf(gripCmdSmoothed) < 0.01f) gripCmdSmoothed = 0.0f;
+
     robot.toolRotateDeg += rotateCmd * TOOL_ROTATE_SPEED_DEG_S * dt;
-    robot.gripperDeg += gripCmd * GRIP_SPEED_DEG_S * dt;
+    robot.gripperDeg += gripCmdSmoothed * GRIP_SPEED_DEG_S * dt;
     robot.toolRotateDeg = clampFloat(robot.toolRotateDeg, TOOL_ROTATE_MIN_DEG, TOOL_ROTATE_MAX_DEG);
     robot.gripperDeg = clampFloat(robot.gripperDeg, GRIP_MIN_DEG, GRIP_MAX_DEG);
 }
@@ -894,6 +902,7 @@ void refreshServos()
 
     const uint32_t now = millis();
     if (now - lastServoUpdateMs < SERVO_PERIOD_MS) return;
+    const float servoDtS = clampFloat(static_cast<float>(now - lastServoUpdateMs) / 1000.0f, 0.0f, 0.1f);
     lastServoUpdateMs = now;
 
     if (fabsf(robot.toolRotateDeg - servoRotateFilteredDeg) > 0.05f)
@@ -901,7 +910,12 @@ void refreshServos()
     else
         servoRotateFilteredDeg = robot.toolRotateDeg;
 
-    servoGripFilteredDeg = robot.gripperDeg;
+    // Схват: обмеження швидкості зміни кута -> серва рухається плавно, а не стрибком
+    {
+        const float maxStep = GRIP_OUTPUT_SLEW_DEG_S * servoDtS;
+        const float err = robot.gripperDeg - servoGripFilteredDeg;
+        servoGripFilteredDeg += clampFloat(err, -maxStep, maxStep);
+    }
 
     static int lastRot = -1;
     const int pr = angleToPulseUs(servoRotateFilteredDeg, SERVO_ROTATE_MIN_US, SERVO_ROTATE_MAX_US);
@@ -975,7 +989,8 @@ void onDisconnectedController(ControllerPtr controller)
 bool gamepadControlsNeutral(float lx, float ly, float rx, float ry, ControllerPtr c)
 {
     return lx == 0.0f && ly == 0.0f && rx == 0.0f && ry == 0.0f &&
-           !c->a() && !c->b() && !c->y() && !c->miscStart();
+           !c->a() && !c->b() && !c->y() && !c->miscStart() &&
+           c->throttle() < 100 && c->brake() < 100;
 }
 
 // Після підключення pad має 0.3 с постояти нейтральним
@@ -1114,16 +1129,21 @@ void processGamepad(float dt)
 
     if (padHoming && motionFinished()) padHoming = false;
 
-    float grip = 0.0f;
+    // Схват: R2 = закрити, L2 = відкрити (плавно, пропорційно натиску);
+    // кнопки A (закрити) / B (відкрити) працюють як і раніше.
+    float grip = (static_cast<float>(c->throttle()) - static_cast<float>(c->brake())) / 1023.0f;
+    if (fabsf(grip) < 0.08f) grip = 0.0f;
     if (c->a()) grip = 1.0f;
     if (c->b()) grip = -1.0f;
+    grip = clampFloat(grip, -1.0f, 1.0f);
 
     float rotCmd = rx;
     const float zCmd = ry;
     if (fabsf(ry) > 0.15f && fabsf(rx) < 0.30f) rotCmd = 0.0f; // Z без випадкового повороту
 
     // Під час повернення в HOME ручне керування серв не втручається в ціль
-    if (!padHoming && (rotCmd != 0.0f || grip != 0.0f)) updateServoTargets(rotCmd, grip, dt);
+    // Викликаємо щоцикл, щоб команда схвата плавно гальмувала після відпускання
+    if (!padHoming) updateServoTargets(rotCmd, grip, dt);
 
     const bool stickMoved = fabsf(lx) > 0.05f || fabsf(ly) > 0.05f || fabsf(zCmd) > 0.05f;
     static bool wasStickActive = false;
