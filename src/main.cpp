@@ -4,6 +4,8 @@
  * 3-осьовий SCARA: геймпад (Bluepad32) + веб-панель по Wi-Fi SoftAP,
  * TEACH-точки в NVS, автоматичне відтворення, 3 колонки.
  *
+ * Геймпад: кнопка Y = повернення в HOME (тільки MANUAL).
+ *
  * HOME ручний: перед подачею живлення / ресетом постав руку в HOME
  * (значення нижче).
  *
@@ -107,15 +109,20 @@ constexpr float MAX_ARM_RADIUS_MM = 185.0f;
 // ============================================================
 constexpr float ARM1_JOG_SPEED_DEG_S = 45.0f;
 constexpr float ARM2_JOG_SPEED_DEG_S = 45.0f;
-constexpr float Z_JOG_SPEED_MM_S = 3.5f;
+constexpr float Z_JOG_SPEED_MM_S = 10.0f; // було 3.5
 constexpr float TOOL_XY_SPEED_MM_S = 40.0f;
 
 constexpr float AUTO_ARM1_SPEED_DEG_S = 40.0f;
 constexpr float AUTO_ARM2_SPEED_DEG_S = 40.0f;
-constexpr float AUTO_Z_SPEED_MM_S = 3.5f;
+constexpr float AUTO_Z_SPEED_MM_S = 10.0f; // було 3.5
+
+// Швидкість повернення в HOME (кнопка Y). Обмежена ARMx_MAX_STEP_HZ / Z_MAX_STEP_HZ.
+constexpr float HOME_ARM1_SPEED_DEG_S = 90.0f; // 90 * 40 кроків/° = 3600 Гц
+constexpr float HOME_ARM2_SPEED_DEG_S = 80.0f; // 80 * 64.7 кроків/° = ~5200 Гц
+constexpr float HOME_Z_SPEED_MM_S = 12.0f;     // 12 * 1600 кроків/мм = 19200 Гц
 
 constexpr float TOOL_ROTATE_SPEED_DEG_S = 45.0f;
-constexpr float GRIP_SPEED_DEG_S = 140.0f;
+constexpr float GRIP_SPEED_DEG_S = 300.0f; // було 140: менше "мертвого ходу" при відкритті
 
 constexpr int SERVO_ROTATE_MIN_US = 500;
 constexpr int SERVO_ROTATE_MAX_US = 2500;
@@ -125,11 +132,11 @@ constexpr float SERVO_ROTATE_FILTER_ALPHA = 0.45f;
 
 constexpr uint32_t ARM1_MAX_STEP_HZ = 12000;
 constexpr uint32_t ARM2_MAX_STEP_HZ = 6000;
-constexpr uint32_t Z_MAX_STEP_HZ = 10000;
+constexpr uint32_t Z_MAX_STEP_HZ = 20000; // 20000 / 1600 = 12.5 мм/с
 
 constexpr uint32_t ARM1_ACCEL = 14000;
 constexpr uint32_t ARM2_ACCEL = 8000;
-constexpr uint32_t Z_ACCEL = 6000;
+constexpr uint32_t Z_ACCEL = 20000; // було 6000: швидший розгін/гальмування
 
 // ============================================================
 // 3 КОЛОНКИ
@@ -235,6 +242,8 @@ float servoGripFilteredDeg = HOME_GRIP_DEG;
 bool previousModeButton = LOW;
 bool previousTeachButton = LOW;
 bool previousPadStart = false;
+bool previousPadY = false; // Y на геймпаді (повернення в HOME)
+bool padHoming = false;    // іде повернення в HOME з геймпада
 uint32_t jogWatchdogMs = 0;
 bool jogContinuousActive = false;
 
@@ -359,6 +368,7 @@ void stopColumnCycle();
 // Миттєва зупинка генераторів кроків
 void emergencyStopMotion()
 {
+    padHoming = false; // будь-яка аварійна зупинка скасовує HOME з геймпада
     stopColumnCycle();
     if (stepperArm1) stepperArm1->forceStopAndNewPosition(stepperArm1->getCurrentPosition());
     if (stepperArm2) stepperArm2->forceStopAndNewPosition(stepperArm2->getCurrentPosition());
@@ -790,6 +800,8 @@ void toggleOperatingMode()
         robot.autoState = AutoState::IDLE;
         robot.gamepadArmed = false;
         previousPadStart = false;
+        previousPadY = false;
+        padHoming = false;
         Serial.printf("Режим: AUTO (%u точок)\n", programPointCount);
     }
     else
@@ -801,6 +813,8 @@ void toggleOperatingMode()
         robot.gamepadArmed = false;
         gamepadNeutralSinceMs = 0;
         previousPadStart = false;
+        previousPadY = false;
+        padHoming = false;
         Serial.println("Режим: MANUAL");
     }
     digitalWrite(PIN_LED_STATUS, robot.operatingMode == OperatingMode::AUTO ? HIGH : LOW);
@@ -961,7 +975,7 @@ void onDisconnectedController(ControllerPtr controller)
 bool gamepadControlsNeutral(float lx, float ly, float rx, float ry, ControllerPtr c)
 {
     return lx == 0.0f && ly == 0.0f && rx == 0.0f && ry == 0.0f &&
-           !c->a() && !c->b() && !c->miscStart();
+           !c->a() && !c->b() && !c->y() && !c->miscStart();
 }
 
 // Після підключення pad має 0.3 с постояти нейтральним
@@ -985,6 +999,7 @@ bool updateGamepadArming(float lx, float ly, float rx, float ry, ControllerPtr c
     {
         robot.gamepadArmed = true;
         previousPadStart = c->miscStart();
+        previousPadY = c->y();
         digitalWrite(PIN_LED_ERROR, LOW);
         Serial.println("Геймпад ARMED");
         return true;
@@ -992,12 +1007,29 @@ bool updateGamepadArming(float lx, float ly, float rx, float ry, ControllerPtr c
     return false;
 }
 
+// Y на геймпаді: повернення в стартову позицію (HOME)
+void goHomeFromGamepad()
+{
+    if (robot.estopLatched || robot.operatingMode != OperatingMode::MANUAL) return;
+
+    stopColumnCycle();
+    jogContinuousActive = false;
+
+    const JointPosition home = {HOME_ARM1_DEG, HOME_ARM2_DEG, HOME_Z_MM};
+    commandCoordinatedJointPosition(home, HOME_ARM1_SPEED_DEG_S, HOME_ARM2_SPEED_DEG_S, HOME_Z_SPEED_MM_S);
+    robot.toolRotateDeg = HOME_TOOL_ROTATE_DEG;
+    robot.gripperDeg = HOME_GRIP_DEG;
+
+    padHoming = true;
+    Serial.println("ГЕЙМПАД: Y — повернення в HOME");
+}
+
 void processJointMode(float ax, float ay, float az, float dt)
 {
     JointPosition t = robot.joints;
     t.arm1Deg += ax * ARM1_JOG_SPEED_DEG_S * dt;
     t.arm2Deg += -ay * ARM2_JOG_SPEED_DEG_S * dt;
-    t.zMm += -az * Z_JOG_SPEED_MM_S * dt;
+    t.zMm += az * Z_JOG_SPEED_MM_S * dt; // стік вгору (az<0) -> рука вгору (Z до 0)
     commandManualJointPosition(t, dt);
 }
 
@@ -1007,7 +1039,7 @@ void processToolMode(float ax, float ay, float az, float dt)
     CartesianPosition d = robot.tcp;
     d.xMm += ax * TOOL_XY_SPEED_MM_S * dt;
     d.yMm += -ay * TOOL_XY_SPEED_MM_S * dt;
-    d.zMm = clampFloat(d.zMm + (-az * Z_JOG_SPEED_MM_S * dt), Z_MIN_MM, Z_MAX_MM);
+    d.zMm = clampFloat(d.zMm + (az * Z_JOG_SPEED_MM_S * dt), Z_MIN_MM, Z_MAX_MM);
 
     const bool elbowUp = robot.joints.arm2Deg >= 0.0f;
     JointPosition j;
@@ -1068,11 +1100,19 @@ void processGamepad(float dt)
     if (!updateGamepadArming(lx, ly, rx, ry, c))
     {
         previousPadStart = padStart;
+        previousPadY = c->y();
         return;
     }
 
     if (padStart && !previousPadStart) toggleControlMode();
     previousPadStart = padStart;
+
+    // Y: повернення в HOME
+    const bool padY = c->y();
+    if (padY && !previousPadY) goHomeFromGamepad();
+    previousPadY = padY;
+
+    if (padHoming && motionFinished()) padHoming = false;
 
     float grip = 0.0f;
     if (c->a()) grip = 1.0f;
@@ -1082,13 +1122,18 @@ void processGamepad(float dt)
     const float zCmd = ry;
     if (fabsf(ry) > 0.15f && fabsf(rx) < 0.30f) rotCmd = 0.0f; // Z без випадкового повороту
 
-    if (rotCmd != 0.0f || grip != 0.0f) updateServoTargets(rotCmd, grip, dt);
+    // Під час повернення в HOME ручне керування серв не втручається в ціль
+    if (!padHoming && (rotCmd != 0.0f || grip != 0.0f)) updateServoTargets(rotCmd, grip, dt);
 
     const bool stickMoved = fabsf(lx) > 0.05f || fabsf(ly) > 0.05f || fabsf(zCmd) > 0.05f;
     static bool wasStickActive = false;
 
     if (stickMoved)
     {
+        // Рух стіком скасовує повернення в HOME (emergencyStopMotion скине padHoming
+        // і синхронізує команду з фактом)
+        if (padHoming) emergencyStopMotion();
+
         wasStickActive = true;
         jogContinuousActive = false; // геймпад важливіший за веб-джог
         if (robot.controlMode == ControlMode::JOINT)
@@ -1230,6 +1275,7 @@ void handleSet()
     if (!webGuard()) return;
 
     jogContinuousActive = false;
+    padHoming = false;
     stopColumnCycle();
 
     JointPosition t = robot.joints;
@@ -1257,6 +1303,7 @@ void handleJog()
         return;
     }
 
+    padHoming = false;
     stopColumnCycle();
 
     const String axis = server.arg("axis");
@@ -1350,6 +1397,7 @@ void handleHome()
 {
     if (!webGuard()) return;
     jogContinuousActive = false;
+    padHoming = false;
     stopColumnCycle();
     const JointPosition home = {HOME_ARM1_DEG, HOME_ARM2_DEG, HOME_Z_MM};
     commandWebJointPosition(home);
@@ -1369,6 +1417,7 @@ void handleColumn()
         if (v >= 1 && v <= 3) mode = static_cast<uint8_t>(v);
     }
     jogContinuousActive = false;
+    padHoming = false;
     startColumnCycle(mode);
     sendJson(200, "{\"status\":\"started\"}");
 }
