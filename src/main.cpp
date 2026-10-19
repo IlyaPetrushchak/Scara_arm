@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <esp_system.h>
 #include <FastAccelStepper.h>
@@ -219,6 +220,9 @@ Servo servoGrip;
 Preferences preferences;
 RobotState robot;
 WebServer server(80);
+
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
 
 #if ENABLE_GAMEPAD
 ControllerPtr controllers[BP32_MAX_GAMEPADS];
@@ -1590,7 +1594,9 @@ void setup()
     preferences.begin("scara-auto", false);
     loadProgram();
 
-    startWifiAp(); // ДО Bluepad32
+    startWifiAp(); 
+
+    dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 
 #if ENABLE_GAMEPAD
     BP32.setup(&onConnectedController, &onDisconnectedController);
@@ -1615,6 +1621,25 @@ void setup()
     server.on("/column_stop", HTTP_GET, handleColumnStop);
     server.begin();
     Serial.println("Веб-панель: http://192.168.4.1");
+    
+    server.onNotFound([]() {
+        server.sendHeader("Location", "http://192.168.4.1/", true);
+        server.send(302, "text/plain", "");
+    
+    
+    server.on("/generate_204", HTTP_GET, []() {
+        server.send(204, "text/plain", ""); 
+    });
+    server.on("/hotspot-detect.html", HTTP_GET, []() {
+        
+        server.sendHeader("Location", "http://192.168.4.1/", true);
+        server.send(302, "text/plain", "");
+    });
+    server.on("/ncsi.txt", HTTP_GET, []() {
+        server.send(200, "text/plain", "Microsoft NCSI"); 
+    });
+
+    });
 
     Serial.printf("Завантажено точок: %u\n", programPointCount);
     printCurrentPosition();
@@ -1626,6 +1651,7 @@ void setup()
 // ============================================================
 void loop()
 {
+    dnsServer.processNextRequest();
 #if ENABLE_GAMEPAD
     BP32.update();
 #endif
