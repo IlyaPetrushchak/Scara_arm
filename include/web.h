@@ -267,7 +267,7 @@ var AUTO_TXT=['Очікує старту','Їде до точки','Пауза �
 var S=null, online=false, everOnline=false, fails=0;
 var step=0, jogging=false, localAuto=0;
 var dragging={}, lastUser={};
-var epoch=0, chain=Promise.resolve();
+var epoch=0, chain=Promise.resolve(), pending=0, lastOk=0, lastWarn=0;
 
 function f(v,d){ return (v==null||isNaN(v))?'—':Number(v).toFixed(d==null?1:d); }
 function locked(){ return !online||!S||S.estop||S.mode==='AUTO'; }
@@ -292,35 +292,47 @@ function raw(path,ms){
 }
 function api(path,o){
   o=o||{};
-  if(o.urgent) return raw(path,2000);
+  if(o.urgent) return raw(path,2500).catch(function(er){
+    if(er.status) throw er;
+    return raw(path,2500);           /* стоп — одна повторна спроба */
+  });
   var e=epoch;
+  pending++;
   var p=chain.then(function(){
     if(!o.poll && e!==epoch) return null;
     if(o.guard && !o.guard()) return null;
-    return raw(path,4000);
+    return raw(path,o.poll?3000:3500);
   });
   chain=p.catch(function(){});
+  var dec=function(){pending--};
+  p.then(dec,dec);
   return p;
 }
 function cmd(path,o){
-  return api(path,o).then(function(j){ setOnline(true); return j; },function(e){
-    if(e.status){ toast(e.status===403?'Аварійна зупинка активна':e.message); }
-    else { setOnline(false); toast('Робот не відповідає'); }
+  return api(path,o).then(function(j){ if(j!==null) noteOk(); return j; },function(e){
+    if(e.status){ noteOk(); toast(e.status===403?'Аварійна зупинка активна':e.message); }
+    else {
+      noteFail();
+      var t=performance.now();
+      if(t-lastWarn>5000){ lastWarn=t; toast('Слабкий зв’язок, повторюю…'); }
+    }
     return null;
   });
 }
 
+/* один збій != офлайн: потрібно кілька поспіль І >4 с без жодної успішної відповіді */
+function noteOk(){ fails=0; lastOk=performance.now(); setOnline(true); }
+function noteFail(){ fails++; if(fails>=4 && performance.now()-lastOk>4000) setOnline(false); }
+
 var polling=false;
 function poll(){
-  if(polling||document.hidden) return;
+  if(polling||document.hidden||pending>0) return;   /* не множимо запити до слабкого ESP32 */
   polling=true;
   api('/state',{poll:true}).then(function(j){
-    S=j; fails=0; setOnline(true); loadCfg(); render();
-  },function(){
-    if(++fails>=5) setOnline(false);
-  }).then(function(){polling=false});
+    if(j){ S=j; noteOk(); loadCfg(); render(); }
+  },function(){ noteFail(); }).then(function(){polling=false});
 }
-setInterval(poll,400);
+setInterval(poll,500);
 document.addEventListener('visibilitychange',function(){ if(document.hidden) endAllJogs(); else poll(); });
 
 function setOnline(v){
@@ -336,7 +348,7 @@ function setOnline(v){
 /* ---------- тротлінг для слайдерів ---------- */
 var thr={};
 function throttled(key,fn,ms){
-  ms=ms||120;
+  ms=ms||150;
   var t=thr[key]||(thr[key]={last:0,timer:null,fn:null});
   var wait=ms-(performance.now()-t.last);
   if(wait<=0){ t.last=performance.now(); t.fn=null; fn(); }
@@ -376,7 +388,7 @@ function bindJog(btn,id,dir){
     active=true; jogging=true; btn.classList.add('on');
     send();
     /* сторожовий таймер прошивки — 1.8 с, тому повторюємо команду */
-    iv=setInterval(send,axis==='rot'?70:600);
+    iv=setInterval(send,axis==='rot'?150:600);
   });
   ['pointerup','pointercancel','lostpointercapture'].forEach(function(t){btn.addEventListener(t,end)});
   btn.addEventListener('contextmenu',function(e){e.preventDefault()});
@@ -638,7 +650,7 @@ cv.addEventListener('pointermove',function(e){
   pad.x=w.x; pad.y=w.y;
   var up=(S?S.a2:0)>=0;
   pad.ok=!!ik(w.x,w.y,up);
-  throttled('pad',function(){padSend(false)},110);
+  throttled('pad',function(){padSend(false)},150);
 });
 function padEnd(){
   if(!pad.on) return;

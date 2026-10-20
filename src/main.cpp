@@ -171,7 +171,8 @@ constexpr bool AUTO_LOOP_PROGRAM = true;
 static const char *AP_SSID = "RoboArm-WiFi";
 static const char *AP_PASS = "12345678";
 constexpr uint8_t AP_CHANNEL = 1;
-constexpr uint8_t AP_MAX_CLIENTS = 3;
+constexpr uint8_t AP_MAX_CLIENTS = 4;
+constexpr bool CAPTIVE_PORTAL_POPUP = true; // true = спливашка при підключенні, false = без неї
 
 // ============================================================
 // ТИПИ
@@ -1216,6 +1217,13 @@ bool initializeSteppers()
 // ============================================================
 // ВЕБ-СЕРВЕР
 // ============================================================
+// Редірект на панель (captive portal)
+void captiveRedirect()
+{
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
+}
+
 void sendJson(int code, const String &body)
 {
     server.sendHeader("Cache-Control", "no-store");
@@ -1356,7 +1364,7 @@ void handleJog()
     // Неперервний джог: їдемо до ліміту, поки веб повторює команду
     if (axis == "rot")
     {
-        robot.toolRotateDeg = clampFloat(robot.toolRotateDeg + dir * 2.0f, TOOL_ROTATE_MIN_DEG, TOOL_ROTATE_MAX_DEG);
+        robot.toolRotateDeg = clampFloat(robot.toolRotateDeg + dir * 4.0f, TOOL_ROTATE_MIN_DEG, TOOL_ROTATE_MAX_DEG);
         sendJson(200, "{\"status\":\"ok\"}");
         return;
     }
@@ -1594,7 +1602,7 @@ void setup()
     preferences.begin("scara-auto", false);
     loadProgram();
 
-    startWifiAp(); 
+    startWifiAp();
 
     dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
 
@@ -1619,27 +1627,37 @@ void setup()
     server.on("/mode", HTTP_GET, handleMode);
     server.on("/column", HTTP_GET, handleColumn);
     server.on("/column_stop", HTTP_GET, handleColumnStop);
+    // Перевірки "чи є інтернет" від телефонів/ПК.
+    // CAPTIVE_PORTAL_POPUP = true  -> редірект на панель: при підключенні САМА вискакує сторінка (як було раніше)
+    // CAPTIVE_PORTAL_POPUP = false -> відповідаємо "інтернет є": без спливашки, зате телефон стабільніше тримає Wi-Fi
+    static const char IOS_OK[] = "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>";
+    if (CAPTIVE_PORTAL_POPUP)
+    {
+        server.on("/generate_204", HTTP_GET, captiveRedirect);
+        server.on("/gen_204", HTTP_GET, captiveRedirect);
+        server.on("/hotspot-detect.html", HTTP_GET, captiveRedirect);
+        server.on("/library/test/success.html", HTTP_GET, captiveRedirect);
+        server.on("/ncsi.txt", HTTP_GET, captiveRedirect);
+        server.on("/connecttest.txt", HTTP_GET, captiveRedirect);
+        server.on("/redirect", HTTP_GET, captiveRedirect);
+        server.on("/canonical.html", HTTP_GET, captiveRedirect);
+        server.on("/success.txt", HTTP_GET, captiveRedirect);
+        server.onNotFound(captiveRedirect);
+    }
+    else
+    {
+        server.on("/generate_204", HTTP_GET, []() { server.send(204, "text/plain", ""); });
+        server.on("/gen_204", HTTP_GET, []() { server.send(204, "text/plain", ""); });
+        server.on("/hotspot-detect.html", HTTP_GET, []() { server.send(200, "text/html", IOS_OK); });
+        server.on("/library/test/success.html", HTTP_GET, []() { server.send(200, "text/html", IOS_OK); });
+        server.on("/ncsi.txt", HTTP_GET, []() { server.send(200, "text/plain", "Microsoft NCSI"); });
+        server.on("/connecttest.txt", HTTP_GET, []() { server.send(200, "text/plain", "Microsoft Connect Test"); });
+        server.onNotFound([]() { server.send(404, "text/plain", ""); });
+    }
+    server.on("/favicon.ico", HTTP_GET, []() { server.send(204, "text/plain", ""); });
+
     server.begin();
     Serial.println("Веб-панель: http://192.168.4.1");
-    
-    server.onNotFound([]() {
-        server.sendHeader("Location", "http://192.168.4.1/", true);
-        server.send(302, "text/plain", "");
-    
-    
-    server.on("/generate_204", HTTP_GET, []() {
-        server.send(204, "text/plain", ""); 
-    });
-    server.on("/hotspot-detect.html", HTTP_GET, []() {
-        
-        server.sendHeader("Location", "http://192.168.4.1/", true);
-        server.send(302, "text/plain", "");
-    });
-    server.on("/ncsi.txt", HTTP_GET, []() {
-        server.send(200, "text/plain", "Microsoft NCSI"); 
-    });
-
-    });
 
     Serial.printf("Завантажено точок: %u\n", programPointCount);
     printCurrentPosition();
