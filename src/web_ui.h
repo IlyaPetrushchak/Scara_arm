@@ -279,8 +279,56 @@ function toast(m){
   clearTimeout(toastT); toastT=setTimeout(function(){t.classList.remove('show')},2600);
 }
 
-/* ---------- мережа: одна черга, щоб команди не перегонялися ---------- */
-function raw(path,ms){
+/* ---------- мережа: WebSocket (основний канал) + HTTP (запасний) ---------- */
+var ws=null, wsOpen=false, wsLastMsg=0, wsId=0, wsWait={};
+function wsLive(){ return wsOpen && performance.now()-wsLastMsg<4000; }
+function wsFailAll(){
+  for(var k in wsWait){ clearTimeout(wsWait[k].t); wsWait[k].rej(new Error('ws closed')); }
+  wsWait={};
+}
+function wsCall(path,ms){
+  return new Promise(function(res,rej){
+    var id=String(++wsId);
+    var t=setTimeout(function(){ delete wsWait[id]; rej(new Error('timeout')); },ms);
+    wsWait[id]={res:res,rej:rej,t:t};
+    try{ ws.send(id+'|'+path); }catch(e){ clearTimeout(t); delete wsWait[id]; rej(e); }
+  });
+}
+function wsOnMessage(ev){
+  var d=ev.data; if(typeof d!=='string') return;
+  wsLastMsg=performance.now();
+  if(d.charAt(0)==='S'){
+    var j=null; try{ j=JSON.parse(d.slice(2)); }catch(_){}
+    if(j){ S=j; noteOk(); loadCfg(); render(); }
+  }else if(d.charAt(0)==='R'){
+    var p1=d.indexOf('|',2), p2=d.indexOf('|',p1+1);
+    var id=d.slice(2,p1), code=+d.slice(p1+1,p2), body=null;
+    try{ body=JSON.parse(d.slice(p2+1)); }catch(_){}
+    var w=wsWait[id]; if(!w) return;
+    clearTimeout(w.t); delete wsWait[id];
+    if(code>=400){ var e=new Error((body&&body.error)||('HTTP '+code)); e.status=code; w.rej(e); }
+    else w.res(body);
+  }
+}
+function wsConnect(){
+  if(ws&&(ws.readyState===0||ws.readyState===1)) return;
+  var me;
+  try{ me=new WebSocket('ws://'+location.hostname+':81/'); }catch(e){ return; }
+  ws=me;
+  me.onopen=function(){ wsOpen=true; wsLastMsg=performance.now(); };
+  me.onmessage=wsOnMessage;
+  me.onerror=function(){};
+  me.onclose=function(){ if(ws===me){ ws=null; wsOpen=false; wsFailAll(); } };
+}
+setInterval(function(){
+  if(document.hidden) return;
+  if(ws&&wsOpen&&performance.now()-wsLastMsg>4000){   /* мовчить -> перепідключаємо */
+    var old=ws; ws=null; wsOpen=false; wsFailAll(); try{old.close()}catch(_){}
+  }
+  wsConnect();
+},1500);
+
+function rawHttp(path,ms){
   var c=new AbortController(), t=setTimeout(function(){c.abort()},ms);
   return fetch(path,{signal:c.signal,cache:'no-store'}).then(function(r){
     clearTimeout(t);
@@ -290,6 +338,7 @@ function raw(path,ms){
     });
   },function(e){ clearTimeout(t); throw e; });
 }
+function raw(path,ms){ return wsLive()?wsCall(path,ms):rawHttp(path,ms); }
 function api(path,o){
   o=o||{};
   if(o.urgent) return raw(path,2500).catch(function(er){
@@ -326,14 +375,14 @@ function noteFail(){ fails++; if(fails>=4 && performance.now()-lastOk>4000) setO
 
 var polling=false;
 function poll(){
-  if(polling||document.hidden||pending>0) return;   /* не множимо запити до слабкого ESP32 */
+  if(polling||document.hidden||pending>0||wsLive()) return;   /* по WebSocket стан приходить сам */   /* не множимо запити до слабкого ESP32 */
   polling=true;
   api('/state',{poll:true}).then(function(j){
     if(j){ S=j; noteOk(); loadCfg(); render(); }
   },function(){ noteFail(); }).then(function(){polling=false});
 }
 setInterval(poll,500);
-document.addEventListener('visibilitychange',function(){ if(document.hidden) endAllJogs(); else poll(); });
+document.addEventListener('visibilitychange',function(){ if(document.hidden) endAllJogs(); else { wsConnect(); poll(); } });
 
 function setOnline(v){
   if(v) everOnline=true;
@@ -348,7 +397,7 @@ function setOnline(v){
 /* ---------- тротлінг для слайдерів ---------- */
 var thr={};
 function throttled(key,fn,ms){
-  ms=ms||150;
+  ms=ms||(wsLive()?60:150);
   var t=thr[key]||(thr[key]={last:0,timer:null,fn:null});
   var wait=ms-(performance.now()-t.last);
   if(wait<=0){ t.last=performance.now(); t.fn=null; fn(); }
@@ -377,7 +426,7 @@ function bindJog(btn,id,dir){
   function end(){
     if(!active) return;
     active=false; clearInterval(iv); btn.classList.remove('on'); jogging=false;
-    if(axis!=='rot') cmd('/jog_stop',{urgent:true,quiet:true});
+    cmd('/jog_stop'+(axis==='rot'?'?axis=rot':''),{urgent:true,quiet:true});
   }
   jogEnders.push(end);
   btn.addEventListener('pointerdown',function(e){
@@ -388,7 +437,7 @@ function bindJog(btn,id,dir){
     active=true; jogging=true; btn.classList.add('on');
     send();
     /* сторожовий таймер прошивки — 1.8 с, тому повторюємо команду */
-    iv=setInterval(send,axis==='rot'?150:600);
+    iv=setInterval(send,axis==='rot'?200:600);
   });
   ['pointerup','pointercancel','lostpointercapture'].forEach(function(t){btn.addEventListener(t,end)});
   btn.addEventListener('contextmenu',function(e){e.preventDefault()});
@@ -606,12 +655,14 @@ function draw(){
   g.fillText('Z',gx,12); g.fillText('300',gx,H-6);
 }
 
-function frame(){
+var lastFrame=0;
+function frame(ts){
   requestAnimationFrame(frame);
   if(!W) return;
+  var fdt=Math.min(.1,Math.max(.001,((ts||0)-lastFrame)/1000)); lastFrame=ts||0;
   if(S){
     if(!Dsp.init){ Dsp.a1=S.act_a1; Dsp.a2=S.act_a2; Dsp.z=S.act_z; Dsp.init=true; }
-    var k=.3;
+    var k=1-Math.exp(-fdt/.07);
     Dsp.a1+=(S.act_a1-Dsp.a1)*k; Dsp.a2+=(S.act_a2-Dsp.a2)*k; Dsp.z+=(S.act_z-Dsp.z)*k;
     Dsp.t1=S.a1; Dsp.t2=S.a2; Dsp.tz=S.z;
   }
@@ -650,7 +701,7 @@ cv.addEventListener('pointermove',function(e){
   pad.x=w.x; pad.y=w.y;
   var up=(S?S.a2:0)>=0;
   pad.ok=!!ik(w.x,w.y,up);
-  throttled('pad',function(){padSend(false)},150);
+  throttled('pad',function(){padSend(false)},wsLive()?60:150);
 });
 function padEnd(){
   if(!pad.on) return;
@@ -695,6 +746,7 @@ function render(){
   $('#padHint').hidden=isAuto||s.estop;
 }
 
+wsConnect();
 poll();
 })();
 </script>
